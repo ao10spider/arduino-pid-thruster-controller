@@ -1,98 +1,155 @@
 // ============================================================
-// Task 07 - Part 1: PID Speed Controller (Stepper + A4988)
+// Task 07 - Part 2: Thruster Safety Cutoff Logic
 // Author: Anton Ouseph
-// Platform: Arduino Uno + A4988 + Stepper Motor (Wokwi)
+// Platform: Arduino (Wokwi Simulator)
+// ============================================================
+// SAFETY RULES CHECKED:
+//   Rule 1 — No two ADJACENT thrusters differ by more than 80
+//             (prevents sudden mechanical jerk)
+//   Rule 2 — No individual thruster value exceeds 230
+//             (prevents overheating)
+//   Rule 3 — Total PWM across all 6 thrusters must not exceed 900
+//             (prevents power overload)
+//
+// If any rule is violated:
+//   - The violation is printed to Serial
+//   - Values are auto-clamped to a safe state
 // ============================================================
 
-#define STEP_PIN   3    // PWM pin → A4988 STEP
-#define DIR_PIN    4    // A4988 DIR
-#define ENABLE_PIN 8    // A4988 ENABLE (LOW = enabled)
+#define NUM_THRUSTERS     6
+#define MAX_SINGLE        230   // Max PWM per thruster (overheat limit)
+#define MAX_TOTAL         900   // Max total power across all thrusters
+#define MAX_ADJACENT_DIFF 80    // Max difference between adjacent thrusters
 
-//PID Constants
-const float Kp = 1.2;
-const float Ki = 0.05;
-const float Kd = 0.8;
+// ============================================================
+// checkAndClamp()
+//   Takes an array of 6 PWM values, checks all safety rules,
+//   prints violations, and clamps to safe values in-place.
+// ============================================================
+void checkAndClamp(int pwm[], int n) {
 
-//State
-float targetRPM  = 200.0;
-float currentRPM = 0.0;
-float prevError  = 0.0;
-float integral   = 0.0;
+  bool violated = false;
 
-const int STEPS_PER_REV = 200;  
+  Serial.println("--- Safety Check ---");
 
-void setup() {
-  Serial.begin(9600);
-  pinMode(STEP_PIN,   OUTPUT);
-  pinMode(DIR_PIN,    OUTPUT);
-  pinMode(ENABLE_PIN, OUTPUT);
-  digitalWrite(ENABLE_PIN, LOW);   // enable the driver
-  digitalWrite(DIR_PIN,    HIGH);  // set direction
-  Serial.println("=== PID Speed Controller (Stepper) ===");
-  Serial.println("Send target RPM via Serial (e.g. 200)");
-  Serial.println("--------------------------------------");
-}
-
-void stepMotor(int steps, int delayUs) {
-  for (int i = 0; i < steps; i++) {
-    digitalWrite(STEP_PIN, HIGH);
-    delayMicroseconds(delayUs);
-    digitalWrite(STEP_PIN, LOW);
-    delayMicroseconds(delayUs);
-  }
-}
-
-void loop() {
-  // Read new target from Serial
-  if (Serial.available() > 0) {
-    float newTarget = Serial.parseFloat();
-    if (newTarget > 0) {
-      targetRPM = newTarget;
-      integral  = 0.0;
-      prevError = 0.0;
-      Serial.print(">> New Target RPM: ");
-      Serial.println(targetRPM);
+  //Rule 1: Adjacent Thruster Jerk Check
+  for (int i = 0; i < n - 1; i++) {
+    int diff = abs(pwm[i] - pwm[i + 1]);
+    if (diff > MAX_ADJACENT_DIFF) {
+      Serial.print("VIOLATION: T");
+      Serial.print(i + 1);
+      Serial.print(" and T");
+      Serial.print(i + 2);
+      Serial.print(" differ by ");
+      Serial.print(diff);
+      Serial.println(" (exceeds jerk limit of 80)");
+      violated = true;
     }
   }
 
-  // PID Calculation 
-  float error = targetRPM - currentRPM;
+  //Rule 2: Single Thruster Overheat Check
+  for (int i = 0; i < n; i++) {
+    if (pwm[i] > MAX_SINGLE) {
+      Serial.print("VIOLATION: T");
+      Serial.print(i + 1);
+      Serial.print(" exceeds max (");
+      Serial.print(pwm[i]);
+      Serial.println(" > 230)");
+      violated = true;
+    }
+  }
 
-  float P = Kp * error;
+  //Rule 3: Total Power Check
+  int total = 0;
+  for (int i = 0; i < n; i++) total += pwm[i];
+  if (total > MAX_TOTAL) {
+    Serial.print("VIOLATION: Total power ");
+    Serial.print(total);
+    Serial.println(" > 900");
+    violated = true;
+  }
 
-  integral = constrain(integral + error, -500, 500);
-  float I = Ki * integral;
+  //Auto-Clamp to Safe State
+  if (violated) {
 
-  float D = Kd * (error - prevError);
-  prevError = error;
+    // Step 1: Clamp each value to MAX_SINGLE
+    for (int i = 0; i < n; i++) {
+      pwm[i] = constrain(pwm[i], 0, MAX_SINGLE);
+    }
 
-  float output = constrain(P + I + D, 0, 255);
+    // Step 2: Scale down proportionally if total still exceeds MAX_TOTAL
+    total = 0;
+    for (int i = 0; i < n; i++) total += pwm[i];
+    if (total > MAX_TOTAL) {
+      float scale = (float)MAX_TOTAL / total;
+      for (int i = 0; i < n; i++) {
+        pwm[i] = (int)(pwm[i] * scale);
+      }
+    }
 
-  //Convert output to step speed
-  // output 0-255 maps to RPM 0-300
-  float targetStepRPM = (output / 255.0) * 300.0;
-  int   stepsToRun    = 10;
-  int   stepDelay     = (targetStepRPM > 0)
-                        ? (int)(60000000.0 / (targetStepRPM * STEPS_PER_REV * 2))
-                        : 5000;
-  stepDelay = constrain(stepDelay, 500, 10000);
+    // Step 3: Smooth adjacent differences
+    // Iteratively reduce differences that still exceed the jerk limit
+    for (int pass = 0; pass < 5; pass++) {
+      for (int i = 0; i < n - 1; i++) {
+        int diff = abs(pwm[i] - pwm[i + 1]);
+        if (diff > MAX_ADJACENT_DIFF) {
+          int avg = (pwm[i] + pwm[i + 1]) / 2;
+          pwm[i]     = avg + MAX_ADJACENT_DIFF / 2;
+          pwm[i + 1] = avg - MAX_ADJACENT_DIFF / 2;
+          // Re-clamp after smoothing
+          pwm[i]     = constrain(pwm[i], 0, MAX_SINGLE);
+          pwm[i + 1] = constrain(pwm[i + 1], 0, MAX_SINGLE);
+        }
+      }
+    }
 
-  //Run motor steps
-  stepMotor(stepsToRun, stepDelay);
+    // Print clamped values
+    Serial.print("Clamped: [");
+    for (int i = 0; i < n; i++) {
+      Serial.print(pwm[i]);
+      if (i < n - 1) Serial.print(", ");
+    }
+    Serial.println("]");
 
-  //Simulate current RPM with noise
-  float noise = random(-8, 8);
-  currentRPM += (output * 0.5 + noise - currentRPM * 0.03);
-  currentRPM  = constrain(currentRPM, 0, 400);
+  } else {
+    Serial.println("All checks PASSED. No violations.");
+  }
 
-  //Serial output
-  Serial.print("Target: ");   Serial.print((int)targetRPM);
-  Serial.print(" RPM | Current: "); Serial.print((int)currentRPM);
-  Serial.print(" | Error: ");  Serial.print((int)error);
-  Serial.print(" | P: ");      Serial.print(P, 1);
-  Serial.print(" I: ");        Serial.print(I, 1);
-  Serial.print(" D: ");        Serial.print(D, 1);
-  Serial.print(" | Output: "); Serial.println((int)output);
+  Serial.println("--------------------");
+}
 
-  delay(300);
+// ============================================================
+void setup() {
+  Serial.begin(9600);
+  Serial.println("=== Thruster Safety Cutoff System ===");
+  Serial.println();
+
+  //Test Case 1: From problem statement
+  Serial.println("Test 1: [120, 200, 80, 255, 90, 180]");
+  int t1[NUM_THRUSTERS] = {120, 200, 80, 255, 90, 180};
+  checkAndClamp(t1, NUM_THRUSTERS);
+  Serial.println();
+
+  //Test Case 2: All within safe limits
+  Serial.println("Test 2: [100, 150, 130, 110, 120, 140]");
+  int t2[NUM_THRUSTERS] = {100, 150, 130, 110, 120, 140};
+  checkAndClamp(t2, NUM_THRUSTERS);
+  Serial.println();
+
+  //Test Case 3: Total power violation
+  Serial.println("Test 3: [200, 210, 190, 180, 200, 220]");
+  int t3[NUM_THRUSTERS] = {200, 210, 190, 180, 200, 220};
+  checkAndClamp(t3, NUM_THRUSTERS);
+  Serial.println();
+
+  //Test Case 4: Jerk only
+  Serial.println("Test 4: [50, 50, 50, 200, 50, 50]");
+  int t4[NUM_THRUSTERS] = {50, 50, 50, 200, 50, 50};
+  checkAndClamp(t4, NUM_THRUSTERS);
+}
+
+// ============================================================
+void loop() {
+  // All logic runs once in setup() for clean demo output
+  // In a real system this would run continuously
 }
